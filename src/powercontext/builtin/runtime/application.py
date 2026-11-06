@@ -489,10 +489,12 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
-            return SourceReceipt(
+            receipt = SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
             )
+            self._runtime.notify_source_count(self.scope_id)
+            return receipt
         async with self._runtime._context(self.scope_id) as context:
             with self._runtime._stage(_MEMORY_CAPTURE_STAGE, attributes={}) as span:
                 source, sequence = await context.sources.capture(
@@ -505,7 +507,9 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
-            return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
+            receipt = SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
+        self._runtime.notify_source_count(self.scope_id)
+        return receipt
 
 
 class SourceApplication:
@@ -2686,6 +2690,7 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+        result = await self._runtime.lifecycle.for_scope(self.scope_id).filter_topic_result(result)
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2998,6 +3003,8 @@ class BuiltinRuntime:
         capabilities: RuntimeCapabilities,
         code_service: CodeService | None = None,
         source_window_limit: int = 100,
+        memory_source_count_threshold: int | None = None,
+        topic_memory_source_count_threshold: int | None = None,
         context_assembly_max_entries: int = 8,
         recall_sufficiency_policy: RecallSufficiencyPolicy | None = None,
         scope_cache_size: int = DEFAULT_SCOPE_CACHE_SIZE,
@@ -3102,6 +3109,9 @@ class BuiltinRuntime:
         self._scheduled_source_runner = scheduled_source_runner
         self._scheduled_experience_runner = scheduled_experience_runner
         self.source_window_limit = source_window_limit
+        self._memory_source_count_threshold = memory_source_count_threshold
+        self._topic_memory_source_count_threshold = topic_memory_source_count_threshold
+        self._scope_ids = scope_ids
         self.context_assembly_max_entries = context_assembly_max_entries
         self.recall_sufficiency_policy = recall_sufficiency_policy
         self._scope_cache = ScopeCache(
@@ -3116,6 +3126,7 @@ class BuiltinRuntime:
         self._operation_depths: dict[asyncio.Task[Any], int] = {}
         self._closing = False
         self._closed = False
+        self._source_count_triggers = None
         self._scheduler: AsyncIOScheduler | None = None
         self._scheduler_runtime_key: str | None = None
         self.sources = SourceApplication(self)
@@ -3129,6 +3140,7 @@ class BuiltinRuntime:
         self.work = WorkApplication(self)
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
+        self._source_lifecycle = None
         self.records = RecordApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
@@ -3144,6 +3156,46 @@ class BuiltinRuntime:
 
     async def __aenter__(self) -> BuiltinRuntime:
         return self
+
+    @property
+    def lifecycle(self):
+        """Return the Source lifecycle application for this Runtime."""
+
+        if self._source_lifecycle is None:
+            from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
+
+            self._source_lifecycle = SourceLifecycleApplication(self)
+        return self._source_lifecycle
+
+    async def start_source_count_triggers(self) -> None:
+        """Start automatic processing for configured per-family Source count thresholds."""
+
+        if self._source_count_triggers is not None:
+            return
+        if self._memory_source_count_threshold is None and self._topic_memory_source_count_threshold is None:
+            return
+        from powercontext.builtin.persistence.database import AsyncDatabase
+        from powercontext.builtin.runtime.source_count_triggers import SourceCountTriggerManager
+
+        database = getattr(self._provider, "database", None)
+        if not isinstance(database, AsyncDatabase):
+            return
+        self._source_count_triggers = SourceCountTriggerManager(
+            self,
+            database,
+            memory_threshold=self._memory_source_count_threshold,
+            topic_memory_threshold=self._topic_memory_source_count_threshold,
+        )
+        await self._source_count_triggers.start()
+
+    def notify_source_count(self, scope_id: str) -> None:
+        """Wake count admission after a newly accepted journal identity."""
+
+        if self._source_count_triggers is not None:
+            self._source_count_triggers.notify(scope_id)
+
+    async def _scope_ids_for_count_triggers(self) -> tuple[str, ...]:
+        return () if self._scope_ids is None else await self._scope_ids()
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         await self.close()
@@ -3282,6 +3334,9 @@ class BuiltinRuntime:
         async with self._close_lock:
             if self._closed:
                 return
+            if self._source_count_triggers is not None:
+                await self._source_count_triggers.close()
+                self._source_count_triggers = None
             if self._scheduler is not None and self._scheduler.running:
                 self._scheduler.pause()
             async with self._lifecycle:
