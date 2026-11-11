@@ -1,0 +1,25 @@
+name: Competition hybrid verification
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/competition-hybrid.yml"
+      - "competition/**"
+      - "src/powercontext/**"
+
+jobs:
+  hybrid:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned competition environment
+        run: |
+          python -m pip install uv
+          make -C competition install
+      - name: Verify PDF, evidence selection, and seekdb hybrid retrieval
+        run: make -C competition test-pdf test-evidence test-hybrid

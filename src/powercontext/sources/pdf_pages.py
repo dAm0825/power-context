@@ -18,14 +18,17 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
+import weakref
+from collections import Counter
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from pypdf import PdfReader
 
 from powercontext.artifacts import MemoryCitation
-from powercontext.builtin.runtime.models import GetMemoryEntryRequest, SearchMemoryRequest
 from powercontext.sources import (
     TEXT_EVIDENCE_PROJECTION_KEY,
     AdapterSourceDefinition,
@@ -72,6 +75,24 @@ _QUERY_STOP_WORDS = frozenset({
     "why",
     "with",
 })
+_PAGE_INDEX_CACHE: weakref.WeakKeyDictionary[object, _PageIndex] = weakref.WeakKeyDictionary()
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedPage:
+    citation: MemoryCitation
+    text: str
+    terms: tuple[str, ...]
+    frequencies: Counter[str]
+    length: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PageIndex:
+    memory_ref: object
+    pages: tuple[_IndexedPage, ...]
+    document_frequencies: Counter[str]
+    average_length: float
 
 
 class PDFDocumentInput(BaseModel):
@@ -232,45 +253,13 @@ async def search_pdf_pages(
         raise ValueError("blank-question")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("invalid-limit")
-    page = await memory.search(
-        SearchMemoryRequest(
-            query=question,
-            mode="fts",
-            limit=max(limit * 4, 32),
-        )
-    )
     query_terms = _query_terms(question)
-    ranked = sorted(
-        page.hits,
-        key=lambda hit: (
-            -_page_relevance(query_terms, hit.text),
-            -hit.score,
-            hit.entry_id,
-        ),
-    )
-
-    citations: list[MemoryCitation] = []
-    seen_pages: set[tuple[str, str]] = set()
-    for hit in ranked:
-        citation = MemoryCitation(
-            memory_ref=hit.memory_ref,
-            entry_id=hit.entry_id,
-            entry_version_id=hit.entry_version_id,
-        )
-        entry = await memory.get(GetMemoryEntryRequest(citation=citation))
-        page_sources = tuple(
-            reference for reference in entry.entry.sources if reference.source_type == PDF_PAGE_SOURCE_NAME
-        )
-        if len(page_sources) != 1:
-            continue
-        identity = (page_sources[0].source_type, page_sources[0].source_id)
-        if identity in seen_pages:
-            continue
-        seen_pages.add(identity)
-        citations.append(citation)
-        if len(citations) >= limit:
-            break
-    return tuple(citations)
+    index = await _memory_page_index(memory)
+    if index is None or not index.pages:
+        return ()
+    scored = [(_page_bm25_score(question, query_terms, page, index), page) for page in index.pages]
+    scored.sort(key=lambda item: (-item[0], item[1].citation.entry_id, item[1].citation.entry_version_id))
+    return tuple(page.citation for _, page in scored[:limit])
 
 
 def pdf_page_source_id(document_id: str, document_sha256: str, page_number: int, /) -> str:
@@ -281,17 +270,99 @@ def pdf_page_source_id(document_id: str, document_sha256: str, page_number: int,
 
 
 def _query_terms(value: str) -> tuple[str, ...]:
-    terms = tuple(term for term in _QUERY_TERM.findall(value.casefold()) if term not in _QUERY_STOP_WORDS)
+    terms = tuple(_query_term(term) for term in _QUERY_TERM.findall(value.casefold()) if term not in _QUERY_STOP_WORDS)
     return tuple(dict.fromkeys(terms))
 
 
-def _page_relevance(query_terms: tuple[str, ...], text: str) -> float:
+async def _memory_page_index(memory) -> _PageIndex | None:
+    try:
+        entries = await memory.list()
+    except Exception:
+        return None
+    if entries.memory_ref is None:
+        return None
+    cached = _PAGE_INDEX_CACHE.get(memory)
+    if cached is not None and cached.memory_ref == entries.memory_ref:
+        return cached
+
+    pages: list[_IndexedPage] = []
+    document_frequencies: Counter[str] = Counter()
+    total_length = 0
+    for record in entries.entries:
+        if not any(reference.source_type == PDF_PAGE_SOURCE_NAME for reference in record.entry.sources):
+            continue
+        terms = tuple(_query_term(term) for term in _QUERY_TERM.findall(record.entry.text.casefold()))
+        frequencies = Counter(terms)
+        document_frequencies.update(frequencies.keys())
+        length = len(terms)
+        total_length += length
+        pages.append(
+            _IndexedPage(
+                citation=record.citation,
+                text=record.entry.text,
+                terms=terms,
+                frequencies=frequencies,
+                length=length,
+            )
+        )
+    if not pages:
+        return None
+    index = _PageIndex(
+        memory_ref=entries.memory_ref,
+        pages=tuple(pages),
+        document_frequencies=document_frequencies,
+        average_length=total_length / len(pages),
+    )
+    _PAGE_INDEX_CACHE[memory] = index
+    return index
+
+
+def _page_bm25_score(
+    question: str,
+    query_terms: tuple[str, ...],
+    page: _IndexedPage,
+    index: _PageIndex,
+) -> float:
     if not query_terms:
         return 0.0
-    page_terms = set(_QUERY_TERM.findall(text.casefold()))
-    matched = sum(term in page_terms for term in query_terms)
-    numeric = sum(term.isdigit() and term in text for term in query_terms)
-    return matched / len(query_terms) + numeric * 0.25
+    score = 0.0
+    matched = 0
+    total = len(index.pages)
+    for term in query_terms:
+        frequency = page.frequencies.get(term, 0)
+        if frequency == 0:
+            continue
+        matched += 1
+        document_frequency = index.document_frequencies.get(term, 1)
+        inverse_document_frequency = math.log(1 + (total - document_frequency + 0.5) / (document_frequency + 0.5))
+        normalization = 1.5 * (1 - 0.75 + 0.75 * page.length / max(index.average_length, 1.0))
+        score += inverse_document_frequency * frequency * 2.5 / (frequency + normalization)
+    coverage = matched / len(query_terms)
+    score *= 0.25 + coverage
+    normalized_text = " ".join(page.terms)
+    if len(query_terms) > 1 and all(term in page.frequencies for term in query_terms):
+        score += 2.0
+    if question.casefold().strip() in page.text.casefold():
+        score += 4.0
+    numeric_terms = tuple(term for term in query_terms if term.isdigit())
+    score += sum(1.5 for term in numeric_terms if term in page.frequencies)
+    if normalized_text.startswith(query_terms[0]):
+        score += 0.1
+    return score
+
+
+def _query_term(term: str) -> str:
+    if len(term) > 5 and term.endswith("ing"):
+        term = term[:-3]
+    elif len(term) > 4 and term.endswith("ed"):
+        term = term[:-2]
+    elif len(term) > 4 and term.endswith("ies"):
+        term = f"{term[:-3]}y"
+    elif len(term) > 4 and term.endswith("es"):
+        term = term[:-2]
+    elif len(term) > 3 and term.endswith("s") and not term.endswith("ss"):
+        term = term[:-1]
+    return term
 
 
 PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
